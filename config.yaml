@@ -3,7 +3,8 @@
 # The local HTTP port. Point OpenAI-compatible clients at http://127.0.0.1:8000/v1
 port_number: 8000
 
-# Keep the service private unless you also configure bearer_token or CODEX_API_TOKEN.
+# Keep the service private unless you also configure bearer_tokens, bearer_token,
+# or CODEX_API_TOKEN.
 host: 127.0.0.1
 
 # Journal/stdout verbosity: debug, info, warning, error, or critical.
@@ -41,6 +42,9 @@ max_concurrent_requests: 2
 # automatic threshold or response cleanup is configured here.
 state_file: codex-api-state.json
 
-# Leave null for localhost-only use. For network access, prefer setting the
-# CODEX_API_TOKEN environment variable rather than committing a secret here.
+# Leave both settings empty for localhost-only use. `bearer_tokens` is an
+# allow-list: when non-empty, requests must use `Authorization: Bearer <token>`.
+# This is the same authorization-header shape used by OpenAI-compatible clients.
+# Prefer a secret manager or environment variable over committing secrets here.
 bearer_token: null
+bearer_tokens: []

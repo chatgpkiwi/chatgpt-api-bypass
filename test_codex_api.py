@@ -128,6 +128,71 @@ class SettingsTests(unittest.TestCase):
 
             self.assertEqual(parsed.log_level, "warning")
 
+    def test_bearer_token_allow_list_is_loaded_from_yaml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lean.md").write_text("Return text only.\n", encoding="utf-8")
+            config = root / "config.yaml"
+            config.write_text(
+                "working_directory: .\nprofile_instructions: lean.md\nbearer_tokens: [first, second]\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(sys, "argv", ["codex-api.py", "--config", str(config)]):
+                parsed = codex_api.parse_args()
+
+            self.assertEqual(parsed.bearer_tokens, frozenset({"first", "second"}))
+
+    def test_bearer_token_allow_list_rejects_invalid_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lean.md").write_text("Return text only.\n", encoding="utf-8")
+            config = root / "config.yaml"
+            config.write_text(
+                "working_directory: .\nprofile_instructions: lean.md\nbearer_tokens: invalid\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(sys, "argv", ["codex-api.py", "--config", str(config)]):
+                with self.assertRaises(SystemExit):
+                    codex_api.parse_args()
+
+
+class AuthenticationTests(unittest.TestCase):
+    def test_standard_bearer_header_accepts_any_configured_token(self):
+        scope = {"headers": [(b"authorization", b"Bearer second")]}
+        self.assertTrue(codex_api.authorized(scope, frozenset({"first", "second"})))
+
+    def test_missing_or_wrong_bearer_header_is_denied_when_tokens_configured(self):
+        tokens = frozenset({"expected"})
+        self.assertFalse(codex_api.authorized({"headers": []}, tokens))
+        self.assertFalse(codex_api.authorized({"headers": [(b"authorization", b"Bearer wrong")]}, tokens))
+
+
+class AuthenticationHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_token_gate_protects_v1_endpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = codex_api.Settings(
+                "127.0.0.1", 0, "codex", root, "read-only", 1,
+                None, None, root / "instructions.md", None, 1, root / "state.json",
+                bearer_tokens=frozenset({"expected"}),
+            )
+            app = codex_api.CodexApi(settings)
+            sent = []
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                sent.append(message)
+
+            await app(
+                {"type": "http", "method": "GET", "path": "/v1/models", "headers": []},
+                receive,
+                send,
+            )
+
+            self.assertEqual(sent[0]["status"], 401)
+
 
 class PromptRenderingTests(unittest.TestCase):
     def test_responses_plain_string_without_instructions_is_byte_exact(self):

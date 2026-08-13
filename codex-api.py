@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
 import contextlib
+import copy
+import hmac
 import json
 import logging
 import os
@@ -23,9 +24,9 @@ import tempfile
 import time
 import tomllib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Collection
 
 import uvicorn
 import yaml
@@ -56,6 +57,7 @@ class Settings:
     state_file: Path
     app_server_start_timeout: float = 30.0
     log_level: str = "info"
+    bearer_tokens: frozenset[str] = field(default_factory=frozenset)
 
 
 def text_from_content(content: Any) -> str:
@@ -1305,7 +1307,13 @@ class CodexApi:
                     send,
                     503,
                     {"status": "unavailable", "backend": "unavailable", "detail": self.app_server.failure},
-                )
+            )
+            return
+        if path.startswith("/v1/") and not authorized(
+            scope,
+            self.settings.bearer_tokens or ({self.settings.bearer_token} if self.settings.bearer_token else set()),
+        ):
+            await send_json(send, 401, error_body("Invalid API key", "authentication_error"))
             return
         if method == "GET" and path == "/v1/models":
             model = self.settings.model or "codex-configured-model"
@@ -1314,11 +1322,6 @@ class CodexApi:
                 200,
                 {"object": "list", "data": [{"id": model, "object": "model", "owned_by": "codex-cli"}]},
             )
-            return
-        if path in {"/v1/chat/completions", "/v1/responses"} and not authorized(
-            scope, self.settings.bearer_token
-        ):
-            await send_json(send, 401, error_body("Invalid API key", "authentication_error"))
             return
         if method == "POST" and path == "/v1/chat/completions":
             await self.handle_chat_completions(receive, send)
@@ -1541,12 +1544,13 @@ async def read_body(receive: AsgiReceive) -> str:
     return b"".join(parts).decode("utf-8")
 
 
-def authorized(scope: dict[str, Any], token: str | None) -> bool:
-    if token is None:
+def authorized(scope: dict[str, Any], tokens: Collection[str]) -> bool:
+    """Accept an OpenAI-compatible ``Authorization: Bearer <API key>`` header."""
+    if not tokens:
         return True
     headers = {key.lower(): value for key, value in scope.get("headers", [])}
     supplied = headers.get(b"authorization", b"").decode("utf-8", errors="replace")
-    return supplied == f"Bearer {token}"
+    return any(hmac.compare_digest(supplied, f"Bearer {token}") for token in tokens)
 
 
 async def send_json(send: AsgiSend, status: int, payload: Any) -> None:
@@ -1712,6 +1716,18 @@ def configured_value(
     return config.get(config_key, fallback)
 
 
+def configured_bearer_tokens(
+    config: dict[str, Any], parser: argparse.ArgumentParser, legacy_token: str | None
+) -> frozenset[str]:
+    """Read the optional YAML token allow-list and reject unsafe/mistyped entries."""
+    value = config.get("bearer_tokens", [])
+    if value is None:
+        value = []
+    if not isinstance(value, list) or any(not isinstance(token, str) or not token.strip() for token in value):
+        parser.error("bearer_tokens must be a YAML list of non-empty strings")
+    return frozenset([*value, *([legacy_token] if legacy_token else [])])
+
+
 def parse_args() -> Settings:
     parser = argparse.ArgumentParser(description=__doc__)
     default_config = Path(__file__).with_name("config.yaml")
@@ -1750,6 +1766,8 @@ def parse_args() -> Settings:
     )
     profile_instructions_value = config.get("profile_instructions")
     bearer_token = configured_value(args.bearer_token, config, "bearer_token", "CODEX_API_TOKEN", None)
+    bearer_token = str(bearer_token) if bearer_token else None
+    bearer_tokens = configured_bearer_tokens(config, parser, bearer_token)
     max_concurrent_requests = configured_value(
         args.max_concurrent_requests, config, "max_concurrent_requests", "CODEX_API_MAX_CONCURRENT", 2
     )
@@ -1808,18 +1826,21 @@ def parse_args() -> Settings:
         model=str(model) if model else None,
         thinking_effort=thinking_effort,
         profile_instructions=profile_instructions,
-        bearer_token=str(bearer_token) if bearer_token else None,
+        bearer_token=bearer_token,
         max_concurrent_requests=max_concurrent_requests,
         state_file=state_file,
         app_server_start_timeout=app_server_start_timeout,
         log_level=log_level.lower(),
+        bearer_tokens=bearer_tokens,
     )
 
 
 def main() -> int:
     settings = parse_args()
     logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
-    if settings.host not in {"127.0.0.1", "localhost", "::1"} and not settings.bearer_token:
+    if settings.host not in {"127.0.0.1", "localhost", "::1"} and not (
+        settings.bearer_token or settings.bearer_tokens
+    ):
         LOG.warning("Listening beyond localhost without CODEX_API_TOKEN authentication")
     uvicorn.run(CodexApi(settings), host=settings.host, port=settings.port, log_level=settings.log_level)
     return 0
