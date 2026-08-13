@@ -69,9 +69,20 @@ class ResponseStateTests(unittest.TestCase):
             self.assertIsNone(state.cumulative_usage_for("old"))
             state.remember("new", "t1", usage(100, 80, 20, 5))
             persisted = json.loads(path.read_text())
-            self.assertEqual(persisted["version"], 2)
+            self.assertEqual(persisted["version"], 3)
             self.assertEqual(persisted["responses"]["old"]["thread_id"], "t1")
             self.assertEqual(persisted["responses"]["new"]["cumulative_usage"]["input_tokens"], 100)
+
+    def test_version_two_state_loads_without_a_context_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps({"version": 2, "responses": {
+                "old": {"thread_id": "t1", "cumulative_usage": usage(10, 0, 2, 0)}
+            }}))
+            state = codex_api.ResponseState(path)
+            self.assertIsNone(state.context_input_tokens_for("old"))
+            state.remember("new", "t1", usage(20, 0, 4, 0), 12)
+            self.assertEqual(json.loads(path.read_text())["responses"]["new"]["context_input_tokens"], 12)
 
     def test_failed_replace_preserves_old_file_and_memory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,6 +112,104 @@ class SettingsTests(unittest.TestCase):
                 parsed = codex_api.parse_args()
 
             self.assertEqual(parsed.profile_instructions, instructions)
+
+    def test_log_level_is_loaded_from_yaml_and_normalized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instructions = root / "lean.md"
+            instructions.write_text("Return text only.\n", encoding="utf-8")
+            config = root / "config.yaml"
+            config.write_text(
+                "working_directory: .\nprofile_instructions: lean.md\nlog_level: WARNING\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(sys, "argv", ["codex-api.py", "--config", str(config)]):
+                parsed = codex_api.parse_args()
+
+            self.assertEqual(parsed.log_level, "warning")
+
+
+class PromptRenderingTests(unittest.TestCase):
+    def test_responses_plain_string_without_instructions_is_byte_exact(self):
+        text = "  <user>delimiter-like</user>\n\tKeep every byte.  "
+        self.assertEqual(codex_api.prompt_from_responses_request({"input": text}), text)
+
+    def test_responses_plain_string_with_null_instructions_is_byte_exact(self):
+        text = "\n\n"
+        self.assertEqual(
+            codex_api.prompt_from_responses_request({"input": text, "instructions": None}), text
+        )
+
+    def test_responses_plain_string_with_developer_instructions_keeps_wrapper(self):
+        self.assertEqual(
+            codex_api.prompt_from_responses_request(
+                {"instructions": "Be terse.", "input": "hello"}
+            ),
+            "Respond to the input below. Return only the assistant's answer; do not "
+            "describe this wrapper or the role labels.\n\n"
+            "<developer>\nBe terse.\n</developer>\n\n<user>\nhello\n</user>",
+        )
+
+    def test_responses_empty_string_and_empty_instructions_retain_existing_wrapper(self):
+        self.assertEqual(codex_api.prompt_from_responses_request({"input": ""}), "")
+        self.assertEqual(
+            codex_api.prompt_from_responses_request({}),
+            "Respond to the input below. Return only the assistant's answer; do not "
+            "describe this wrapper or the role labels.\n\n<user>\n\n</user>",
+        )
+        self.assertEqual(
+            codex_api.prompt_from_responses_request({"instructions": "", "input": ""}),
+            "Respond to the input below. Return only the assistant's answer; do not "
+            "describe this wrapper or the role labels.\n\n<user>\n\n</user>",
+        )
+
+    def test_responses_message_arrays_keep_supported_roles_labelled(self):
+        messages = [
+            {"type": "message", "role": "system", "content": "system text"},
+            {"type": "message", "role": "developer", "content": "developer text"},
+            {"type": "message", "role": "user", "content": "user text"},
+            {"type": "message", "role": "assistant", "content": "assistant text"},
+        ]
+        prompt = codex_api.prompt_from_responses_request({"input": messages})
+        for role in ("system", "developer", "user", "assistant"):
+            self.assertIn(f"<{role}>\n{role} text\n</{role}>", prompt)
+        self.assertTrue(prompt.startswith("Respond to the input below."))
+
+    def test_responses_rejects_unsupported_items_roles_and_instructions(self):
+        with self.assertRaisesRegex(ValueError, "type is unsupported"):
+            codex_api.prompt_from_responses_request({"input": [{"type": "image"}]})
+        with self.assertRaisesRegex(ValueError, "role is unsupported"):
+            codex_api.prompt_from_responses_request({"input": [{"role": "tool", "content": "x"}]})
+        with self.assertRaisesRegex(ValueError, "instructions.*string or null"):
+            codex_api.prompt_from_responses_request({"input": "x", "instructions": 1})
+
+    def test_chat_completions_rendering_is_unchanged(self):
+        self.assertEqual(
+            codex_api.prompt_from_messages([{"role": "user", "content": "hello"}]),
+            "Respond to the conversation below. Return only the assistant's answer "
+            "to the final user message; do not describe this wrapper or the role labels.\n\n"
+            "<user>\nhello\n</user>",
+        )
+
+
+class CompactionValidationTests(unittest.TestCase):
+    def test_documented_context_management_form(self):
+        self.assertEqual(codex_api.compaction_threshold([
+            {"type": "compaction", "compact_threshold": 123}
+        ]), 123)
+        self.assertIsNone(codex_api.compaction_threshold(None))
+
+    def test_rejects_invalid_context_management(self):
+        invalid = [
+            {}, [], [{}], [{"type": "other", "compact_threshold": 1}],
+            [{"type": "compaction", "compact_threshold": 0}],
+            [{"type": "compaction", "compact_threshold": True}],
+            [{"type": "compaction", "compact_threshold": 1, "extra": 1}],
+            [{"type": "compaction", "compact_threshold": 1}] * 2,
+        ]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                codex_api.compaction_threshold(value)
 
 
 class ResponsesStoreFalseTests(unittest.IsolatedAsyncioTestCase):

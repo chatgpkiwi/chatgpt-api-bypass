@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import tomllib
@@ -35,6 +37,7 @@ AsgiSend = Callable[[dict[str, Any]], Awaitable[None]]
 LOG = logging.getLogger("codex-api")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 LEAN_PROFILE_NAME = "codex-api-lean"
+_TOML_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,7 @@ class Settings:
     max_concurrent_requests: int
     state_file: Path
     app_server_start_timeout: float = 30.0
+    log_level: str = "info"
 
 
 def text_from_content(content: Any) -> str:
@@ -98,18 +102,26 @@ def prompt_from_messages(messages: Any) -> str:
 
 def prompt_from_responses_request(request: dict[str, Any]) -> str:
     """Render supported Responses API text input as one Codex turn."""
+    input_value = request.get("input", "")
+    instructions = request.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        raise ValueError("`instructions` must be a string or null")
+
+    # The lean base instructions already establish the text-only response
+    # contract.  Preserve a plain caller string byte-for-byte when there is no
+    # top-level instruction that needs an unambiguous role boundary.  This is
+    # deliberately limited to Responses: Chat Completions are stateless and
+    # must continue rendering their complete role-labelled history.
+    if "input" in request and isinstance(input_value, str) and instructions is None:
+        return input_value
+
     sections = [
         "Respond to the input below. Return only the assistant's answer; do not "
         "describe this wrapper or the role labels."
     ]
-    instructions = request.get("instructions")
-    if instructions is not None:
-        if not isinstance(instructions, str):
-            raise ValueError("`instructions` must be a string or null")
-        if instructions:
-            sections.append(f"<developer>\n{instructions}\n</developer>")
+    if instructions:
+        sections.append(f"<developer>\n{instructions}\n</developer>")
 
-    input_value = request.get("input", "")
     if isinstance(input_value, str):
         sections.append(f"<user>\n{input_value}\n</user>")
         return "\n\n".join(sections)
@@ -228,6 +240,45 @@ def incremental_usage(
         LOG.warning("Cannot calculate Codex cache-write delta; omitting cache-write counter")
         delta.pop("cache_write_input_tokens", None)
     return delta
+
+
+def combined_usage(*usages: dict[str, Any]) -> dict[str, Any]:
+    """Add independent App Server passes without inventing unavailable counters."""
+    result: dict[str, Any] = {}
+    for name in USAGE_COUNTERS:
+        values = [usage_counter(usage, name) for usage in usages]
+        # Main counters are always present in the installed protocol.  The
+        # optional cache-write counter is omitted unless every pass exposed it.
+        if any(value is None for value in values):
+            continue
+        result[name] = sum(values)
+    return result
+
+
+def compaction_threshold(context_management: Any) -> int | None:
+    """Validate the documented server-side Responses compaction selector.
+
+    The OpenAI API represents this as an array of context-management objects.
+    This text-only proxy has one native compaction mechanism, so accepting more
+    than one selector would have ambiguous threshold semantics.
+    """
+    if context_management is None:
+        return None
+    if not isinstance(context_management, list):
+        raise ValueError("`context_management` must be an array")
+    if len(context_management) != 1:
+        raise ValueError("`context_management` must contain exactly one compaction object")
+    setting = context_management[0]
+    if not isinstance(setting, dict):
+        raise ValueError("`context_management[0]` must be an object")
+    if setting.get("type") != "compaction":
+        raise ValueError("`context_management[0].type` must be `compaction`")
+    threshold = setting.get("compact_threshold")
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold <= 0:
+        raise ValueError("`context_management[0].compact_threshold` must be a positive integer")
+    if set(setting) != {"type", "compact_threshold"}:
+        raise ValueError("`context_management[0]` contains unsupported fields")
+    return threshold
 
 
 def responses_usage(chat_usage: dict[str, Any]) -> dict[str, Any]:
@@ -353,17 +404,37 @@ class ResponseState:
         usage = record.get("cumulative_usage")
         return dict(usage) if isinstance(usage, dict) else None
 
-    def remember(self, response_id: str, thread_id: str, cumulative_usage: dict[str, Any]) -> None:
+    def context_input_tokens_for(self, response_id: str) -> int | None:
+        """Return the predecessor's latest rendered context size, if recorded.
+
+        Version-1/2 records intentionally return ``None``: their cumulative
+        counters cannot reliably say how large the active context was.
+        """
+        record = self.responses.get(response_id)
+        if not isinstance(record, dict):
+            return None
+        value = record.get("context_input_tokens")
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    def remember(
+        self,
+        response_id: str,
+        thread_id: str,
+        cumulative_usage: dict[str, Any],
+        context_input_tokens: int | None = None,
+    ) -> None:
         record = {
             "thread_id": thread_id,
             "cumulative_usage": cumulative_usage,
             "created_at": int(time.time()),
         }
+        if context_input_tokens is not None:
+            record["context_input_tokens"] = context_input_tokens
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temporary_path.write_text(
-                json.dumps({"version": 2, "responses": {**self.responses, response_id: record}}, indent=2)
+                json.dumps({"version": 3, "responses": {**self.responses, response_id: record}}, indent=2)
                 + "\n",
                 encoding="utf-8",
             )
@@ -389,6 +460,12 @@ class TurnResult:
     usage: dict[str, Any]
     cumulative_usage: dict[str, Any]
     thread_id: str
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    usage: dict[str, Any]
+    cumulative_usage: dict[str, Any]
 
 
 def app_server_usage(breakdown: Any) -> dict[str, Any] | None:
@@ -425,8 +502,10 @@ class AppServerClient:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._thread_events: dict[str, asyncio.Queue[dict[str, Any] | BaseException]] = {}
         self._loaded_threads: set[str] = set()
+        self._disabled_skills_config: dict[str, Any] | None = None
         self._write_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._skills_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._ready = False
@@ -445,6 +524,14 @@ class AppServerClient:
         # user's base config or catalog.
         for key, value in _profile_config_overrides(LEAN_PROFILE_NAME):
             command.extend(["--config", f"{key}={_toml_literal(value)}"])
+        # Config tables merge across Codex's user, project, profile, and CLI
+        # layers.  An empty `mcp_servers` table would therefore leave inherited
+        # entries alive.  Enumerate every reachable configured server and set
+        # its leaf `enabled` value at CLI-override precedence *before* the App
+        # Server starts, so no MCP child or connection is created for the proxy.
+        mcp_names = _configured_mcp_server_names(self.settings.working_directory, LEAN_PROFILE_NAME)
+        if mcp_names:
+            command.extend(["--config", _mcp_servers_disabled_override(mcp_names)])
         if self.settings.thinking_effort:
             command.extend(
                 ["--config", f'model_reasoning_effort="{self.settings.thinking_effort}"']
@@ -461,6 +548,7 @@ class AppServerClient:
             self.failure = None
             self._stopping = False
             self._loaded_threads.clear()
+            self._disabled_skills_config = None
             try:
                 _ensure_lean_profile(self.settings.profile_instructions)
                 LOG.info("Starting persistent Codex App Server in %s", self.settings.working_directory)
@@ -493,6 +581,14 @@ class AppServerClient:
                 )
                 await self.notify("initialized", {})
                 self._ready = True
+                # Disabled MCP servers must not even be initialized: merely
+                # hiding their tools at thread setup would still leak server
+                # instructions/resources and permit startup side effects.
+                await self._verify_no_mcp_servers()
+                # Discover the exact skill set for this working directory
+                # before serving any turn.  A discovery failure is fail-closed:
+                # this text-only proxy must not silently expose a skills prompt.
+                await self._disabled_skills_thread_config()
                 LOG.info("Codex App Server initialized")
             except (AppServerError, asyncio.TimeoutError) as error:
                 await self._stop_process()
@@ -530,6 +626,32 @@ class AppServerClient:
         self._stderr_task = None
         self._fail_pending(AppServerUnavailable("Codex App Server stopped"))
         self._loaded_threads.clear()
+        self._disabled_skills_config = None
+
+    async def _verify_no_mcp_servers(self) -> None:
+        """Fail closed unless the process-local overrides yielded no MCP inventory."""
+        result = await self.request(
+            "mcpServerStatus/list",
+            {"detail": "toolsAndAuthOnly"},
+            timeout=self.settings.app_server_start_timeout,
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise AppServerError("Codex App Server returned malformed mcpServerStatus/list results")
+        if result.get("nextCursor") is not None:
+            raise AppServerError("Codex App Server returned paginated MCP inventory; refusing proxy startup")
+        for status in result["data"]:
+            # The installed status method includes configured-but-disabled
+            # names.  Those are safe only when it exposes no initialized
+            # server metadata, tools, resources, or resource templates.
+            if not isinstance(status, dict) or not isinstance(status.get("name"), str):
+                raise AppServerError("Codex App Server returned malformed MCP server status")
+            if (
+                status.get("serverInfo") is not None
+                or status.get("tools") != {}
+                or status.get("resources") != []
+                or status.get("resourceTemplates") != []
+            ):
+                raise AppServerError("Codex App Server still exposes an MCP server; refusing proxy startup")
 
     async def request(
         self,
@@ -630,6 +752,13 @@ class AppServerClient:
         if not isinstance(params, dict):
             LOG.warning("Ignoring malformed App Server notification %s", method)
             return
+        if method == "skills/changed":
+            # The installed protocol documents this notification as an
+            # invalidation signal.  The next thread creation/resume refreshes
+            # its complete disable list before it can start a model turn.
+            self._disabled_skills_config = None
+            LOG.info("Codex App Server skill set changed; disabling configuration will refresh")
+            return
         thread_id = params.get("threadId")
         if isinstance(thread_id, str):
             self._thread_events.setdefault(thread_id, asyncio.Queue()).put_nowait(message)
@@ -724,6 +853,84 @@ class AppServerClient:
                 f"Codex App Server turn exceeded the {self.settings.timeout_seconds:g}-second timeout"
             ) from error
 
+    async def compact_thread(self, thread_id: str) -> CompactionResult:
+        """Run and drain the installed native asynchronous compaction lifecycle.
+
+        `thread/compact/start` acknowledges scheduling only.  The actual work
+        has its own `turn/started`, token-usage update, context-compaction item,
+        and terminal `turn/completed` notifications on the normal per-thread
+        queue.  Draining all of them before returning prevents those events from
+        being consumed by the next user turn.
+        """
+        if not self.healthy:
+            raise AppServerUnavailable(self.failure or "Codex App Server is unavailable")
+        if thread_id not in self._loaded_threads:
+            await self._resume_thread(thread_id)
+        queue = self._thread_events.setdefault(thread_id, asyncio.Queue())
+        await self.request(
+            "thread/compact/start", {"threadId": thread_id}, timeout=self.settings.timeout_seconds
+        )
+        compact_turn_id: str | None = None
+        last_usage: dict[str, Any] | None = None
+        total_usage: dict[str, Any] | None = None
+        saw_context_compaction = False
+        try:
+            while True:
+                event = await asyncio.wait_for(queue.get(), timeout=self.settings.timeout_seconds)
+                if isinstance(event, BaseException):
+                    raise event
+                method = event.get("method")
+                params = event.get("params")
+                if not isinstance(params, dict):
+                    raise AppServerError("Codex App Server emitted malformed compaction notification")
+                if method == "turn/started":
+                    turn = params.get("turn")
+                    candidate = turn.get("id") if isinstance(turn, dict) else None
+                    if not isinstance(candidate, str):
+                        raise AppServerError("Codex App Server started compaction without a turn ID")
+                    compact_turn_id = candidate
+                    continue
+                event_turn_id = params.get("turnId")
+                if method == "turn/completed" and isinstance(params.get("turn"), dict):
+                    event_turn_id = params["turn"].get("id")
+                if compact_turn_id is None or event_turn_id != compact_turn_id:
+                    continue
+                if method == "item/completed":
+                    item = params.get("item")
+                    completed_at = params.get("completedAtMs")
+                    if isinstance(completed_at, bool) or not isinstance(completed_at, int):
+                        raise AppServerError("Codex App Server emitted malformed compaction notification")
+                    if isinstance(item, dict) and item.get("type") == "contextCompaction":
+                        saw_context_compaction = True
+                elif method == "thread/compacted":
+                    # Kept for compatibility with the installed schema's
+                    # deprecated notification while preferring the item event.
+                    saw_context_compaction = True
+                elif method == "thread/tokenUsage/updated":
+                    token_usage = params.get("tokenUsage")
+                    if isinstance(token_usage, dict):
+                        last_usage = app_server_usage(token_usage.get("last"))
+                        total_usage = app_server_usage(token_usage.get("total"))
+                elif method == "turn/completed":
+                    turn = params.get("turn")
+                    if not isinstance(turn, dict) or turn.get("status") != "completed":
+                        detail = turn.get("error") if isinstance(turn, dict) else None
+                        raise AppServerError(f"Codex App Server compaction did not complete: {detail or 'unknown'}")
+                    if not saw_context_compaction:
+                        raise AppServerError("Codex App Server compaction completed without a context-compaction event")
+                    if not last_usage or not total_usage:
+                        raise AppServerError("Codex App Server compaction completed without token-usage notification")
+                    return CompactionResult(last_usage, total_usage)
+        except asyncio.TimeoutError as error:
+            if compact_turn_id:
+                with contextlib.suppress(AppServerError, asyncio.TimeoutError):
+                    await self.request(
+                        "turn/interrupt", {"threadId": thread_id, "turnId": compact_turn_id}, timeout=5
+                    )
+            raise AppServerError(
+                f"Codex App Server compaction exceeded the {self.settings.timeout_seconds:g}-second timeout"
+            ) from error
+
     async def _start_thread(self, ephemeral: bool) -> str:
         params: dict[str, Any] = {
             "cwd": str(self.settings.working_directory),
@@ -736,6 +943,7 @@ class AppServerClient:
         }
         if self.settings.model:
             params["model"] = self.settings.model
+        params["config"] = await self._disabled_skills_thread_config()
         result = await self.request("thread/start", params, timeout=self.settings.timeout_seconds)
         return self._remember_thread(result, "thread/start")
 
@@ -750,6 +958,7 @@ class AppServerClient:
         }
         if self.settings.model:
             params["model"] = self.settings.model
+        params["config"] = await self._disabled_skills_thread_config()
         result = await self.request("thread/resume", params, timeout=self.settings.timeout_seconds)
         resumed_id = self._remember_thread(result, "thread/resume")
         if resumed_id != thread_id:
@@ -764,6 +973,66 @@ class AppServerClient:
         self._loaded_threads.add(thread_id)
         self._thread_events.setdefault(thread_id, asyncio.Queue())
         return thread_id
+
+    async def _disabled_skills_thread_config(self) -> dict[str, Any]:
+        """Discover and disable every skill visible in this proxy's CWD.
+
+        `thread/start.config` and `thread/resume.config` accept regular Codex
+        configuration values.  The installed v2 `skills/list` response exposes
+        each skill's stable path, which is the selector accepted by
+        `skills.config`; names are deliberately not hard-coded so future CLI
+        upgrades cannot advertise newly added skills to a proxy thread.
+        """
+        async with self._skills_lock:
+            if self._disabled_skills_config is not None:
+                return copy.deepcopy(self._disabled_skills_config)
+
+            result = await self.request(
+                "skills/list",
+                {"cwds": [str(self.settings.working_directory)]},
+                timeout=self.settings.timeout_seconds,
+            )
+            config = self._disabled_skills_config_from_result(result)
+            self._disabled_skills_config = config
+            return copy.deepcopy(config)
+
+    def _disabled_skills_config_from_result(self, result: Any) -> dict[str, Any]:
+        """Validate `skills/list` strictly enough to preserve fail-closed behavior."""
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise AppServerError("Codex App Server returned malformed skills/list results")
+
+        expected_cwd = self.settings.working_directory.resolve()
+        matching_entries: list[dict[str, Any]] = []
+        for entry in result["data"]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("cwd"), str):
+                raise AppServerError("Codex App Server returned malformed skills/list entries")
+            try:
+                entry_cwd = Path(entry["cwd"]).resolve()
+            except OSError as error:
+                raise AppServerError("Codex App Server returned an invalid skills/list working directory") from error
+            if entry_cwd == expected_cwd:
+                matching_entries.append(entry)
+
+        if len(matching_entries) != 1:
+            raise AppServerError("Codex App Server did not return exactly one skills/list entry for the configured working directory")
+        entry = matching_entries[0]
+        errors = entry.get("errors")
+        skills = entry.get("skills")
+        if not isinstance(errors, list) or errors:
+            raise AppServerError("Codex App Server could not completely discover skills for the configured working directory")
+        if not isinstance(skills, list):
+            raise AppServerError("Codex App Server returned malformed skills/list skills")
+
+        paths: set[str] = set()
+        disabled: list[dict[str, Any]] = []
+        for skill in skills:
+            if not isinstance(skill, dict) or not isinstance(skill.get("path"), str) or not skill["path"]:
+                raise AppServerError("Codex App Server returned a skill without a valid path")
+            path = skill["path"]
+            if path not in paths:
+                paths.add(path)
+                disabled.append({"path": path, "enabled": False})
+        return {"skills": {"config": disabled}}
 
 
 def _agent_message_texts(items: Any) -> list[str]:
@@ -813,11 +1082,6 @@ shell_snapshot = false
 shell_tool = false
 tool_suggest = false
 unified_exec = false
-
-# Disable the existing Docs MCP server for proxy requests.
-[mcp_servers.openaiDeveloperDocs]
-url = "https://developers.openai.com/mcp"
-enabled = false
 '''
 
 
@@ -827,7 +1091,7 @@ def _codex_home() -> Path:
 
 
 def _profile_points_to(profile_path: Path, instructions_path: Path) -> bool:
-    """Whether a readable profile explicitly selects the requested instructions."""
+    """Whether the complete managed profile matches this proxy revision."""
     try:
         with profile_path.open("rb") as profile_file:
             parsed = tomllib.load(profile_file)
@@ -835,7 +1099,11 @@ def _profile_points_to(profile_path: Path, instructions_path: Path) -> bool:
         return False
     if not isinstance(parsed, dict):
         return False
-    return parsed.get("model_instructions_file") == str(instructions_path)
+    try:
+        expected = tomllib.loads(_lean_profile_contents(instructions_path))
+    except tomllib.TOMLDecodeError:  # pragma: no cover - static template guard
+        return False
+    return parsed == expected
 
 
 def _ensure_lean_profile(instructions_path: Path) -> Path:
@@ -894,7 +1162,8 @@ def _profile_config_overrides(profile: str) -> list[tuple[str, Any]]:
             for child_key, child_value in value.items():
                 if not isinstance(child_key, str):
                     raise AppServerUnavailable(f"Codex profile {profile_path} has a non-string key")
-                walk(f"{prefix}.{child_key}" if prefix else child_key, child_value)
+                quoted_key = _toml_key(child_key)
+                walk(f"{prefix}.{quoted_key}" if prefix else quoted_key, child_value)
         elif value is not None:
             leaves.append((prefix, value))
         else:
@@ -902,6 +1171,87 @@ def _profile_config_overrides(profile: str) -> list[tuple[str, Any]]:
 
     walk("", parsed)
     return leaves
+
+
+def _toml_key(key: str) -> str:
+    """Serialize one TOML dotted-key segment without treating a server name as syntax."""
+    if _TOML_BARE_KEY.fullmatch(key):
+        return key
+    return json.dumps(key, ensure_ascii=False)
+
+
+def _mcp_servers_disabled_override(names: list[str]) -> str:
+    """Make one merge-safe TOML table override disabling the supplied names.
+
+    The installed CLI accepts a normal dotted leaf for bare names but does not
+    parse a quoted dotted-key segment.  An inline table is both valid TOML for
+    arbitrary server names and merges its entry with the inherited transport
+    settings, as verified with CLI 0.144.6.
+    """
+    return "mcp_servers={" + ",".join(
+        f"{_toml_key(name)}={{enabled=false}}" for name in names
+    ) + "}"
+
+
+def _toml_mcp_server_names(path: Path, *, required: bool) -> set[str]:
+    """Read MCP table keys only, never values that might contain credentials."""
+    try:
+        with path.open("rb") as config_file:
+            parsed = tomllib.load(config_file)
+    except FileNotFoundError:
+        if required:
+            raise AppServerUnavailable(f"Could not load Codex configuration {path}: file is missing")
+        return set()
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise AppServerUnavailable(f"Could not load Codex configuration {path}: {error}") from error
+    if not isinstance(parsed, dict):
+        raise AppServerUnavailable(f"Codex configuration {path} is not a TOML table")
+    servers = parsed.get("mcp_servers")
+    if servers is None:
+        return set()
+    if not isinstance(servers, dict):
+        raise AppServerUnavailable(f"Codex configuration {path} has an invalid mcp_servers table")
+    names: set[str] = set()
+    for name, server in servers.items():
+        if not isinstance(name, str) or not name or not isinstance(server, dict):
+            raise AppServerUnavailable(f"Codex configuration {path} has an invalid MCP server entry")
+        names.add(name)
+    return names
+
+
+def _codex_project_config_paths(working_directory: Path) -> list[Path]:
+    """Return all project config layers that Codex can resolve for this CWD."""
+    try:
+        cwd = working_directory.resolve(strict=True)
+    except OSError as error:
+        raise AppServerUnavailable(f"Could not resolve Codex working directory {working_directory}: {error}") from error
+    project_root = cwd
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / ".git").exists():
+            project_root = candidate
+            break
+    layers = [cwd]
+    while layers[-1] != project_root:
+        layers.append(layers[-1].parent)
+    return [parent / ".codex" / "config.toml" for parent in reversed(layers)]
+
+
+def _configured_mcp_server_names(working_directory: Path, profile: str) -> list[str]:
+    """Find every MCP server that can be inherited by this App Server process.
+
+    This intentionally collects a safe superset of trusted project layers.
+    Disabling an entry that Codex would later ignore is harmless, while missing
+    one would allow a server to start before a thread can be configured.
+    """
+    paths = [_codex_home() / "config.toml", Path("/etc/codex/config.toml")]
+    paths.extend(_codex_project_config_paths(working_directory))
+    names: set[str] = set()
+    for path in paths:
+        names.update(_toml_mcp_server_names(path, required=False))
+
+    profile_path = _codex_home() / f"{profile}.config.toml"
+    names.update(_toml_mcp_server_names(profile_path, required=True))
+    return sorted(names)
 
 
 def _toml_literal(value: Any) -> str:
@@ -1035,8 +1385,7 @@ class CodexApi:
                 raise ValueError("request body must be a JSON object")
             if request.get("background") is True:
                 raise ValueError("`background` is not supported")
-            if request.get("context_management") is not None:
-                raise ValueError("`context_management` and compaction are not supported")
+            requested_compaction_threshold = compaction_threshold(request.get("context_management"))
             if request.get("conversation") is not None:
                 raise ValueError("`conversation` is not supported; use `previous_response_id`")
             if request.get("tools"):
@@ -1054,6 +1403,7 @@ class CodexApi:
 
         thread_id = None
         previous_cumulative_usage = None
+        previous_context_input_tokens = None
         if previous_response_id:
             thread_id = self.response_state.thread_for(previous_response_id)
             if thread_id is None:
@@ -1068,24 +1418,48 @@ class CodexApi:
                 )
                 return
             previous_cumulative_usage = self.response_state.cumulative_usage_for(previous_response_id)
+            previous_context_input_tokens = self.response_state.context_input_tokens_for(
+                previous_response_id
+            )
 
         should_store = request.get("store") is not False
         requested_model = str(request.get("model") or self.settings.model or "codex-configured-model")
+        active_context_input_tokens: int | None = None
         try:
             async with self.capacity:
                 if thread_id:
                     thread_lock = self.thread_locks.setdefault(thread_id, asyncio.Lock())
                     async with thread_lock:
+                        compaction: CompactionResult | None = None
+                        # The threshold applies to the active rendered context,
+                        # not lifetime thread usage.  Legacy records lack that
+                        # measurement, so they safely skip this one pre-turn
+                        # compaction and gain a measurement after the next turn.
+                        if (
+                            requested_compaction_threshold is not None
+                            and previous_context_input_tokens is not None
+                            and previous_context_input_tokens >= requested_compaction_threshold
+                        ):
+                            compaction = await self.app_server.compact_thread(thread_id)
                         result = await self.run_codex(
                             prompt,
                             thread_id=thread_id,
                             ephemeral=not should_store,
                         )
+                        active_context_input_tokens = usage_counter(result.usage, "input_tokens")
+                        if compaction is not None:
+                            result = TurnResult(
+                                result.text,
+                                combined_usage(compaction.usage, result.usage),
+                                result.cumulative_usage,
+                                result.thread_id,
+                            )
                 else:
                     result = await self.run_codex(
                         prompt,
                         ephemeral=not should_store,
                     )
+                    active_context_input_tokens = usage_counter(result.usage, "input_tokens")
         except AppServerError as error:
             LOG.error("Responses request failed: %s", error)
             await send_json(send, 502, error_body(str(error), "api_error"))
@@ -1098,7 +1472,12 @@ class CodexApi:
         turn_usage = result.usage
         if should_store:
             try:
-                self.response_state.remember(response_id, result.thread_id, result.cumulative_usage)
+                self.response_state.remember(
+                    response_id,
+                    result.thread_id,
+                    result.cumulative_usage,
+                    active_context_input_tokens,
+                )
             except OSError as error:
                 LOG.error("Could not persist response state: %s", error)
                 await send_json(
@@ -1352,6 +1731,7 @@ def parse_args() -> Settings:
     parser.add_argument("--max-concurrent-requests", type=int)
     parser.add_argument("--state-file", type=Path)
     parser.add_argument("--app-server-start-timeout", type=float)
+    parser.add_argument("--log-level")
     args = parser.parse_args()
     config_path = args.config.expanduser().resolve()
     config = load_config(config_path, parser)
@@ -1383,6 +1763,7 @@ def parse_args() -> Settings:
         "CODEX_API_APP_SERVER_START_TIMEOUT",
         30,
     )
+    log_level = configured_value(args.log_level, config, "log_level", "CODEX_API_LOG_LEVEL", "info")
 
     try:
         port = int(port)
@@ -1395,6 +1776,8 @@ def parse_args() -> Settings:
         parser.error("sandbox must be `read-only` or `workspace-write`")
     if thinking_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
         parser.error("thinking_effort must be minimal, low, medium, high, or xhigh")
+    if not isinstance(log_level, str) or log_level.lower() not in {"critical", "error", "warning", "info", "debug"}:
+        parser.error("log_level must be critical, error, warning, info, or debug")
     if not isinstance(profile_instructions_value, str) or not profile_instructions_value.strip():
         parser.error("profile_instructions must be a non-empty path to an instructions file")
 
@@ -1429,15 +1812,16 @@ def parse_args() -> Settings:
         max_concurrent_requests=max_concurrent_requests,
         state_file=state_file,
         app_server_start_timeout=app_server_start_timeout,
+        log_level=log_level.lower(),
     )
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = parse_args()
+    logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
     if settings.host not in {"127.0.0.1", "localhost", "::1"} and not settings.bearer_token:
         LOG.warning("Listening beyond localhost without CODEX_API_TOKEN authentication")
-    uvicorn.run(CodexApi(settings), host=settings.host, port=settings.port, log_level="info")
+    uvicorn.run(CodexApi(settings), host=settings.host, port=settings.port, log_level=settings.log_level)
     return 0
 
 

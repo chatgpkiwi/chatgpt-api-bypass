@@ -65,6 +65,109 @@ class AppServerTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(item.startswith("model_catalog_json=") for item in command))
             self.assertIn("features.shell_tool=false", command)
 
+    async def test_process_disables_every_inherited_mcp_name_before_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = settings(root)
+            request_log = root / "requests.jsonl"
+            base_config = Path(self.codex_home.name) / "config.toml"
+            base_config.write_text(
+                '''[mcp_servers.enabled]
+url = "https://example.invalid/enabled"
+
+[mcp_servers."dot.name / spaces"]
+command = "never-run"
+
+[mcp_servers.already_disabled]
+url = "https://example.invalid/disabled"
+enabled = false
+required = true
+''',
+                encoding="utf-8",
+            )
+            project_config = root / ".codex" / "config.toml"
+            project_config.parent.mkdir()
+            project_config.write_text(
+                '''[mcp_servers.future_server]
+command = "never-run"
+''',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(codex_api.os.environ, {"FAKE_APP_SERVER_REQUEST_LOG": str(request_log)}):
+                client = codex_api.AppServerClient(config)
+                await client.start()
+                try:
+                    self.assertTrue(client.healthy)
+                finally:
+                    await client.stop()
+
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            argv = next(record["params"] for record in records if record["method"] == "process/argv")
+            overrides = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == "--config"]
+            self.assertIn(
+                'mcp_servers={already_disabled={enabled=false},"dot.name / spaces"={enabled=false},enabled={enabled=false},future_server={enabled=false}}',
+                overrides,
+            )
+            status = next(record["params"] for record in records if record["method"] == "mcpServerStatus/list")
+            self.assertEqual(status, {"detail": "toolsAndAuthOnly"})
+
+    async def test_mcp_inventory_nonempty_malformed_or_paginated_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = settings(Path(directory))
+            for mode, expected in (
+                ("one", "still exposes an MCP server"),
+                ("several", "still exposes an MCP server"),
+                ("malformed", "malformed mcpServerStatus/list"),
+                ("paged", "paginated MCP inventory"),
+            ):
+                with self.subTest(mode=mode), mock.patch.dict(
+                    codex_api.os.environ, {"FAKE_APP_SERVER_MCP_STATUS": mode}
+                ):
+                    client = codex_api.AppServerClient(config)
+                    with self.assertRaisesRegex(codex_api.AppServerUnavailable, expected):
+                        await client.start()
+                    self.assertFalse(client.healthy)
+
+    async def test_malformed_mcp_config_fails_before_app_server_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (Path(self.codex_home.name) / "config.toml").write_text(
+                "mcp_servers = []\n", encoding="utf-8"
+            )
+            client = codex_api.AppServerClient(settings(root))
+            with self.assertRaisesRegex(codex_api.AppServerUnavailable, "invalid mcp_servers table"):
+                await client.start()
+            self.assertIsNone(client.process)
+
+    async def test_restart_reloads_newly_added_mcp_server_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            base_config = Path(self.codex_home.name) / "config.toml"
+            base_config.write_text('[mcp_servers.before]\ncommand = "never-run"\n', encoding="utf-8")
+            with mock.patch.dict(codex_api.os.environ, {"FAKE_APP_SERVER_REQUEST_LOG": str(request_log)}):
+                first = codex_api.AppServerClient(settings(root))
+                await first.start()
+                await first.stop()
+                base_config.write_text(
+                    '''[mcp_servers.before]
+command = "never-run"
+
+[mcp_servers.after_upgrade]
+command = "never-run"
+''',
+                    encoding="utf-8",
+                )
+                second = codex_api.AppServerClient(settings(root))
+                await second.start()
+                await second.stop()
+
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            argv_records = [record["params"] for record in records if record["method"] == "process/argv"]
+            self.assertEqual(len(argv_records), 2)
+            self.assertFalse(any("after_upgrade={enabled=false}" in value for value in argv_records[0]))
+            self.assertTrue(any("after_upgrade={enabled=false}" in value for value in argv_records[1]))
+
     async def test_startup_repairs_a_missing_or_mispointed_fixed_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             config = settings(Path(directory))
@@ -80,6 +183,7 @@ class AppServerTransportTests(unittest.IsolatedAsyncioTestCase):
                 profile = codex_api.tomllib.load(profile_file)
             self.assertEqual(profile["model_instructions_file"], str(config.profile_instructions))
             self.assertFalse(profile["features"]["shell_tool"])
+            self.assertNotIn("mcp_servers", profile)
 
     async def test_handshake_new_thread_text_and_incremental_usage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +265,11 @@ class AppServerTransportTests(unittest.IsolatedAsyncioTestCase):
                     "ephemeral": False,
                     "approvalPolicy": "never",
                     "model": "gpt-5.6-luna",
+                    "config": {
+                        "skills": {"config": [
+                            {"path": "/fake/skills/existing/SKILL.md", "enabled": False},
+                        ]},
+                    },
                 },
             )
             self.assertEqual(
@@ -171,8 +280,95 @@ class AppServerTransportTests(unittest.IsolatedAsyncioTestCase):
                     "sandbox": "read-only",
                     "approvalPolicy": "never",
                     "model": "gpt-5.6-luna",
+                    "config": {
+                        "skills": {"config": [
+                            {"path": "/fake/skills/existing/SKILL.md", "enabled": False},
+                        ]},
+                    },
                 },
             )
+
+    async def test_skills_discovery_disables_future_skills_on_new_and_resumed_threads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = settings(root)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(codex_api.os.environ, {
+                "FAKE_APP_SERVER_REQUEST_LOG": str(request_log),
+                "FAKE_APP_SERVER_SKILLS": "future",
+            }):
+                first = codex_api.AppServerClient(config)
+                await first.start()
+                try:
+                    original = await first.run_turn("one", ephemeral=False)
+                finally:
+                    await first.stop()
+
+                resumed = codex_api.AppServerClient(config)
+                await resumed.start()
+                try:
+                    await resumed.run_turn("two", thread_id=original.thread_id, ephemeral=False)
+                finally:
+                    await resumed.stop()
+
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            expected = [
+                {"path": "/fake/skills/existing/SKILL.md", "enabled": False},
+                {"path": "/fake/skills/future/SKILL.md", "enabled": False},
+            ]
+            for method in ("thread/start", "thread/resume"):
+                params = next(record["params"] for record in records if record["method"] == method)
+                self.assertEqual(params["config"]["skills"]["config"], expected)
+                self.assertEqual(params["approvalPolicy"], "never")
+                self.assertEqual(params["sandbox"], "read-only")
+
+    async def test_skills_discovery_failure_or_malformed_result_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = settings(Path(directory))
+            for mode, expected in (("error", "skill discovery failed"), ("malformed", "malformed skills/list")):
+                with self.subTest(mode=mode), mock.patch.dict(
+                    codex_api.os.environ, {"FAKE_APP_SERVER_SKILLS": mode}
+                ):
+                    client = codex_api.AppServerClient(config)
+                    with self.assertRaisesRegex(codex_api.AppServerUnavailable, expected):
+                        await client.start()
+                    self.assertFalse(client.healthy)
+
+    async def test_zero_skills_is_a_valid_empty_thread_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(codex_api.os.environ, {
+                "FAKE_APP_SERVER_SKILLS": "zero",
+                "FAKE_APP_SERVER_REQUEST_LOG": str(request_log),
+            }):
+                client = codex_api.AppServerClient(settings(root))
+                await client.start()
+                try:
+                    await client.run_turn("zero")
+                finally:
+                    await client.stop()
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            started = next(record["params"] for record in records if record["method"] == "thread/start")
+            self.assertEqual(started["config"], {"skills": {"config": []}})
+
+    async def test_skills_changed_invalidates_cached_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(codex_api.os.environ, {
+                "FAKE_APP_SERVER_REQUEST_LOG": str(request_log),
+            }):
+                client = codex_api.AppServerClient(settings(root))
+                await client.start()
+                try:
+                    await client.run_turn("one")
+                    await client._dispatch({"method": "skills/changed", "params": {}})
+                    await client.run_turn("two")
+                finally:
+                    await client.stop()
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(sum(record["method"] == "skills/list" for record in records), 2)
 
     async def test_timeout_malformed_json_and_child_death_are_reported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -202,6 +398,41 @@ class AppServerTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(dead.healthy)
             finally:
                 await dead.stop()
+
+    async def test_native_compaction_drains_its_turn_before_the_next_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(codex_api.os.environ, {"FAKE_APP_SERVER_REQUEST_LOG": str(request_log)}):
+                client = codex_api.AppServerClient(settings(root))
+                await client.start()
+                try:
+                    await client.run_turn("first", ephemeral=False)
+                    compacted = await client.compact_thread("thread-1")
+                    result = await client.run_turn("after", thread_id="thread-1", ephemeral=False)
+                finally:
+                    await client.stop()
+            self.assertEqual(compacted.usage["input_tokens"], 7)
+            self.assertEqual(result.text, "answer:after")
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            methods = [record["method"] for record in records]
+            self.assertLess(methods.index("thread/compact/start"), len(methods) - 1)
+            self.assertEqual(methods[methods.index("thread/compact/start") + 1], "turn/start")
+
+    async def test_native_compaction_timeout_failure_and_malformed_notifications_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = settings(Path(directory), timeout=0.03)
+            for mode, expected in (("hang", "compaction exceeded"), ("failed", "compaction did not complete"),
+                                   ("malformed", "malformed compaction notification")):
+                with self.subTest(mode=mode), mock.patch.dict(codex_api.os.environ, {"FAKE_APP_SERVER_COMPACTION": mode}):
+                    client = codex_api.AppServerClient(config)
+                    await client.start()
+                    try:
+                        await client.run_turn("first", ephemeral=False)
+                        with self.assertRaisesRegex(codex_api.AppServerError, expected):
+                            await client.compact_thread("thread-1")
+                    finally:
+                        await client.stop()
 
 
 class AppServerHttpTests(unittest.IsolatedAsyncioTestCase):
@@ -261,6 +492,28 @@ class AppServerHttpTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await app.stop()
 
+    async def test_responses_plain_string_reaches_app_server_without_a_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(
+                codex_api.os.environ, {"FAKE_APP_SERVER_REQUEST_LOG": str(request_log)}
+            ):
+                app = codex_api.CodexApi(settings(root))
+                await app.start()
+                try:
+                    status, body = await request(
+                        app, "/v1/responses", {"input": "  <user>exact</user>\n "}
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertEqual(body["output"][0]["content"][0]["text"], "answer:  <user>exact</user>")
+                finally:
+                    await app.stop()
+
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            turn = next(record["params"] for record in records if record["method"] == "turn/start")
+            self.assertEqual(turn["input"], [{"type": "text", "text": "  <user>exact</user>\n "}])
+
     async def test_health_reports_backend_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             app = codex_api.CodexApi(settings(Path(directory)))
@@ -274,6 +527,53 @@ class AppServerHttpTests(unittest.IsolatedAsyncioTestCase):
 
             await app({"type": "http", "method": "GET", "path": "/health", "headers": []}, receive, send)
             self.assertEqual(sent[0]["status"], 503)
+
+    async def test_responses_context_management_compacts_then_aggregates_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(codex_api.os.environ, {"FAKE_APP_SERVER_REQUEST_LOG": str(request_log)}):
+                app = codex_api.CodexApi(settings(root))
+                await app.start()
+                try:
+                    _, first = await request(app, "/v1/responses", {"input": "first"})
+                    status, body = await request(app, "/v1/responses", {
+                        "input": "second", "previous_response_id": first["id"],
+                        "context_management": [{"type": "compaction", "compact_threshold": 10}],
+                    })
+                finally:
+                    await app.stop()
+            self.assertEqual(status, 200)
+            self.assertEqual(body["usage"]["input_tokens"], 17)
+            self.assertEqual(body["usage"]["input_tokens_details"]["cached_tokens"], 6)
+            self.assertEqual(body["usage"]["output_tokens"], 5)
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([r["method"] for r in records].count("thread/compact/start"), 1)
+            self.assertEqual(app.response_state.context_input_tokens_for(body["id"]), 10)
+
+    async def test_responses_context_management_below_threshold_and_invalid_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_log = root / "requests.jsonl"
+            with mock.patch.dict(codex_api.os.environ, {"FAKE_APP_SERVER_REQUEST_LOG": str(request_log)}):
+                app = codex_api.CodexApi(settings(root))
+                await app.start()
+                try:
+                    _, first = await request(app, "/v1/responses", {"input": "first"})
+                    status, _ = await request(app, "/v1/responses", {
+                        "input": "second", "previous_response_id": first["id"],
+                        "context_management": [{"type": "compaction", "compact_threshold": 11}],
+                    })
+                    invalid_status, invalid = await request(app, "/v1/responses", {
+                        "input": "bad", "context_management": {"type": "compaction"},
+                    })
+                finally:
+                    await app.stop()
+            self.assertEqual(status, 200)
+            self.assertEqual(invalid_status, 400)
+            self.assertIn("must be an array", invalid["error"]["message"])
+            records = [json.loads(line) for line in request_log.read_text(encoding="utf-8").splitlines()]
+            self.assertNotIn("thread/compact/start", [r["method"] for r in records])
 
 
 class SameThreadSerializationTests(unittest.IsolatedAsyncioTestCase):
@@ -297,6 +597,16 @@ class SameThreadSerializationTests(unittest.IsolatedAsyncioTestCase):
                     thread_id or "new-thread",
                 )
 
+            async def compact_thread(self, thread_id):
+                self.active += 1
+                self.maximum = max(self.maximum, self.active)
+                await asyncio.sleep(0.02)
+                self.active -= 1
+                return codex_api.CompactionResult(
+                    {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0},
+                    {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0},
+                )
+
             async def start(self):
                 pass
 
@@ -306,10 +616,10 @@ class SameThreadSerializationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             backend = Backend()
             app = codex_api.CodexApi(settings(Path(directory)), app_server=backend)
-            app.response_state.remember("previous", "thread-1", {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0})
+            app.response_state.remember("previous", "thread-1", {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1, "reasoning_output_tokens": 0}, 1)
             first, second = await asyncio.gather(
-                request(app, "/v1/responses", {"input": "a", "previous_response_id": "previous"}),
-                request(app, "/v1/responses", {"input": "b", "previous_response_id": "previous"}),
+                request(app, "/v1/responses", {"input": "a", "previous_response_id": "previous", "context_management": [{"type": "compaction", "compact_threshold": 1}]}),
+                request(app, "/v1/responses", {"input": "b", "previous_response_id": "previous", "context_management": [{"type": "compaction", "compact_threshold": 1}]}),
             )
             self.assertEqual(first[0], 200)
             self.assertEqual(second[0], 200)

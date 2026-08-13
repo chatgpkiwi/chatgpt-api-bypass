@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "responses": {
     "resp_ad3510ec08704b9cb5c7017149cf0ee2": {
       "thread_id": "019ff6f6-9a36-7300-b3ee-35fc71b178a0",
@@ -200,6 +200,27 @@
         "reasoning_output_tokens": 0
       },
       "created_at": 1786603747
+    },
+    "resp_179bbc15d45e4b9a8a5092232c5c8ba3": {
+      "thread_id": "019ff9f4-ab17-7231-bb7e-92ddc135c8ab",
+      "cumulative_usage": {
+        "input_tokens": 804,
+        "cached_input_tokens": 0,
+        "output_tokens": 12,
+        "reasoning_output_tokens": 0
+      },
+      "created_at": 1786604992
+    },
+    "resp_4df436bc5dfc43c487030a0377094d0e": {
+      "thread_id": "019ffa27-b389-7ce3-a597-7f7d233a7e9a",
+      "cumulative_usage": {
+        "input_tokens": 804,
+        "cached_input_tokens": 0,
+        "output_tokens": 12,
+        "reasoning_output_tokens": 0
+      },
+      "created_at": 1786608336,
+      "context_input_tokens": 804
     }
   }
 }
