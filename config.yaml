@@ -1,0 +1,41 @@
+# Settings for codex-api.py. Command-line arguments override these values.
+
+# The local HTTP port. Point OpenAI-compatible clients at http://127.0.0.1:8000/v1
+port_number: 8000
+
+# Keep the service private unless you also configure bearer_token or CODEX_API_TOKEN.
+host: 127.0.0.1
+
+# The Codex model and reasoning effort used for every API request.
+model: gpt-5.6-luna
+thinking_effort: low
+
+# One persistent `codex app-server` process runs turns in this directory.
+working_directory: /home/lucio/Documents
+codex_binary: codex
+# At every startup, codex-api.py configures the fixed `codex-api-lean` profile
+# to use this project-owned file. Relative paths are resolved from this YAML.
+profile_instructions: codex-api-lean-instructions.md
+
+# Codex is prevented from editing files unless you explicitly choose workspace-write.
+sandbox: read-only
+
+# Fail one API request if Codex takes longer than this many seconds.
+timeout_seconds: 300
+
+# Fail application startup if the local App Server has not completed its
+# initialize/initialized handshake in this interval.
+app_server_start_timeout_seconds: 30
+
+# Limits active turns. Different App Server threads may run concurrently;
+# turns on one thread remain serialized.
+max_concurrent_requests: 2
+
+# Maps OpenAI-style response IDs to persisted Codex thread IDs. This enables
+# `previous_response_id` continuation across proxy restarts. No compaction or
+# automatic cleanup is performed.
+state_file: codex-api-state.json
+
+# Leave null for localhost-only use. For network access, prefer setting the
+# CODEX_API_TOKEN environment variable rather than committing a secret here.
+bearer_token: null
