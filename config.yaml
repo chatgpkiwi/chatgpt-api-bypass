@@ -1,0 +1,50 @@
+# Settings for codex-api.py. Command-line arguments override these values.
+
+# The local HTTP port. Point OpenAI-compatible clients at http://127.0.0.1:8000/v1
+port_number: 8000
+
+# Keep the service private unless you also configure bearer_tokens, bearer_token,
+# or CODEX_API_TOKEN.
+host: 127.0.0.1
+
+# Journal/stdout verbosity: debug, info, warning, error, or critical.
+# Use warning to suppress normal INFO request and startup messages.
+log_level: info
+
+# The Codex model and reasoning effort used for every API request.
+model: gpt-5.6-luna
+thinking_effort: low
+
+# One persistent `codex app-server` process runs turns in this directory.
+working_directory: ~/Documents
+codex_binary: codex
+# At every startup, codex-api.py configures the fixed `codex-api-lean` profile
+# to use this project-owned file. Relative paths are resolved from this YAML.
+profile_instructions: codex-api-lean-instructions.md
+
+# Codex is prevented from editing files unless you explicitly choose workspace-write.
+sandbox: read-only
+
+# Fail one API request if Codex takes longer than this many seconds.
+timeout_seconds: 300
+
+# Fail application startup if the local App Server has not completed its
+# initialize/initialized handshake in this interval.
+app_server_start_timeout_seconds: 30
+
+# Limits active turns. Different App Server threads may run concurrently;
+# turns on one thread remain serialized.
+max_concurrent_requests: 2
+
+# Maps OpenAI-style response IDs to persisted Codex thread IDs. This enables
+# `previous_response_id` continuation across proxy restarts. Context compaction
+# is caller-selected per Responses request with `context_management`; no global
+# automatic threshold or response cleanup is configured here.
+state_file: codex-api-state.json
+
+# Leave both settings empty for localhost-only use. `bearer_tokens` is an
+# allow-list: when non-empty, requests must use `Authorization: Bearer <token>`.
+# This is the same authorization-header shape used by OpenAI-compatible clients.
+# Prefer a secret manager or environment variable over committing secrets here.
+bearer_token: null
+bearer_tokens: []

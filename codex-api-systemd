@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Install and manage codex-api as a per-user systemd service.
+#
+# Optional overrides:
+#   CODEX_API_PYTHON=/path/to/python ./codex-api-systemd install
+
+set -euo pipefail
+
+SERVICE_NAME="codex-api.service"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_PATH="$UNIT_DIR/$SERVICE_NAME"
+SYSTEMCTL="${CODEX_API_SYSTEMCTL:-systemctl}"
+
+usage() {
+    cat <<'EOF'
+Usage: ./codex-api-systemd <install|uninstall|start|stop|restart|status>
+
+Installs codex-api as a service for the current user. Do not run this helper
+with sudo. Every management command uses `systemctl --user`.
+The generated unit always uses this project's codex-api.py and config.yaml,
+so it runs with the current user's Codex configuration and login credentials.
+
+Set CODEX_API_PYTHON to choose the Python interpreter. By default, the helper
+uses .venv/bin/python in this project when present, otherwise python3 from PATH.
+EOF
+}
+
+require_user() {
+    if [[ $EUID -eq 0 ]]; then
+        echo "This installs a per-user service. Run it as the Codex user, without sudo." >&2
+        exit 1
+    fi
+}
+
+systemctl_user() {
+    "$SYSTEMCTL" --user "$@"
+}
+
+python_path() {
+    if [[ -n "${CODEX_API_PYTHON:-}" ]]; then
+        [[ -x "$CODEX_API_PYTHON" ]] || {
+            echo "CODEX_API_PYTHON is not executable: $CODEX_API_PYTHON" >&2
+            exit 1
+        }
+        printf '%s\n' "$CODEX_API_PYTHON"
+    elif [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+        printf '%s\n' "$SCRIPT_DIR/.venv/bin/python"
+    else
+        command -v python3
+    fi
+}
+
+systemd_quote() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '"%s"' "$value"
+}
+
+install_service() {
+    local python
+    python="$(python_path)"
+    install -d -m 700 "$UNIT_DIR"
+
+    {
+        cat <<EOF
+[Unit]
+Description=codex-api OpenAI-compatible local API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+Environment=$(systemd_quote "HOME=$HOME")
+Environment=$(systemd_quote "PATH=$PATH")
+ExecStart=$(systemd_quote "$python") $(systemd_quote "$SCRIPT_DIR/codex-api.py") --config $(systemd_quote "$SCRIPT_DIR/config.yaml")
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    } >"$UNIT_PATH"
+
+    systemctl_user daemon-reload
+    systemctl_user enable "$SERVICE_NAME"
+    systemctl_user start "$SERVICE_NAME"
+    echo "Installed and started $SERVICE_NAME"
+    echo "Unit: $UNIT_PATH"
+}
+
+uninstall_service() {
+    systemctl_user disable --now "$SERVICE_NAME" 2>/dev/null || true
+    rm -f -- "$UNIT_PATH"
+    systemctl_user daemon-reload
+    echo "Uninstalled $SERVICE_NAME"
+}
+
+main() {
+    case "${1:-}" in
+        install)
+            require_user
+            install_service
+            ;;
+        uninstall)
+            require_user
+            uninstall_service
+            ;;
+        start|stop|restart|status)
+            require_user
+            systemctl_user "$1" "$SERVICE_NAME"
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
